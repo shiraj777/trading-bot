@@ -14,18 +14,18 @@ def root():
 @app.get("/signals/{ticker}", response_model=SignalResponse)
 def get_signal(
     ticker: str,
-    period: str = Query("6mo"),
-    interval: str = Query("1d"),
-    equity: float = Query(10000.0),
-    risk_pct: float = Query(0.01),
+    period: str = Query("6mo", description="ytd, 1mo, 3mo, 6mo, 1y, etc."),
+    interval: str = Query("1d", description="1d, 1h, 30m, 15m (yfinance-supported)"),
+    equity: float = Query(10000.0, description="Capital in USD"),
+    risk_pct: float = Query(0.01, description="Risk per trade (0.01 = 1%)"),
 ):
     try:
         raw = fetch_bars(ticker, period=period, interval=interval)
         df = add_indicators(raw)
         if df.empty or len(df) < 20:
             raise HTTPException(status_code=400, detail="Not enough data after indicators.")
-        decision = decide(df)
 
+        decision = decide(df)
         price = float(df["close"].iloc[-1])
         atr = float(df["atr"].iloc[-1])
         qty, stop, take = position_size(equity=equity, atr=atr, price=price, risk_pct=risk_pct)
@@ -44,18 +44,11 @@ def get_signal(
         raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
-    
 
-    # DEBUG ONLY: החזר עמודות גולמיות
+# DEBUG ONLY (optional): inspect raw columns coming from yfinance
 @app.get("/debug/cols/{ticker}")
 def debug_columns(ticker: str, period: str = "6mo", interval: str = "1d"):
     import yfinance as yf
-    import pandas as pd
-    raw = yf.download(ticker, period=period, interval=interval, auto_adjust=False, progress=False, group_by="column")
-    if raw is None or raw.empty:
-        return {"cols": [], "note": "empty"}
-    cols = list(raw.columns)
-    # נשטח עמודות אם זה MultiIndex
-    if isinstance(raw.columns, pd.MultiIndex):
-        cols = list(raw.columns.get_level_values(-1))
-    return {"cols": [str(c) for c in cols]}
+    t = yf.Ticker(ticker)
+    raw = t.history(period=period, interval=interval, auto_adjust=True)
+    return {"cols": [str(c) for c in raw.columns]} if raw is not None else {"cols": []}
