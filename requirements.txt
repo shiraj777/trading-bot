@@ -1,5 +1,14 @@
-pandas
-numpy
-fastapi
-uvicorn[standard]
-scikit-learn
+fastapi>=0.112
+uvicorn[standard]>=0.30
+
+pandas>=2.2
+numpy>=1.26
+
+yfinance>=0.2.40
+ta>=0.11.0
+
+scikit-learn>=1.5
+python-dotenv>=1.0make docker-build
+docker run -d -p 8000:8000 --name trading-bot trading-bot
+curl -fsS http://127.0.0.1:8000/healthz
+docker rm -f trading-bot
