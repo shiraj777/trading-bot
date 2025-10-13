@@ -1,0 +1,38 @@
+name: docker-ci
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+jobs:
+  build-and-test:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Build Docker image
+        run: docker build -t trading-bot .
+
+      - name: Run container
+        run: docker run -d -p 8000:8000 --name trading-bot trading-bot
+
+      - name: Wait for server
+        run: |
+          for i in {1..30}; do
+            if curl -s http://127.0.0.1:8000/healthz | grep -q '"status":"ok"'; then
+              echo "Server is up"; exit 0; fi
+            sleep 1
+          done
+          echo "Server failed to start"; docker logs trading-bot; exit 1
+
+      - name: Smoke test /signals
+        run: |
+          curl -sSf "http://127.0.0.1:8000/signals/AAPL?period=6mo&interval=1d" | head -c 300
+
+      - name: Always stop container
+        if: always()
+        run: docker rm -f trading-bot || true
