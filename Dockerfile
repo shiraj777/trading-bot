@@ -1,20 +1,24 @@
-# syntax=docker/dockerfile:1
+# ---- Base image ----
 FROM python:3.11-slim
 
-ENV PYTHONDONTWRITEBYTECODE=1 \
-    PYTHONUNBUFFERED=1
-
+# ---- Set working directory ----
 WORKDIR /app
 
-# מתקינים תלויות פייתון
+# ---- Copy dependency files ----
 COPY requirements.txt .
-RUN pip install --no-cache-dir --upgrade pip \
- && pip install --no-cache-dir -r requirements.txt
 
-# מעתיקים את קוד האפליקציה
+# ---- Install dependencies ----
+RUN pip install --no-cache-dir -r requirements.txt
+
+# ---- Copy the rest of the code ----
 COPY . .
 
-EXPOSE 8000
+# ---- Environment configuration ----
+ENV PYTHONUNBUFFERED=1
+ENV PORT=10000
 
-# מריצים את FastAPI עם Uvicorn
-CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000"]
+# ---- Expose the port (Render expects $PORT) ----
+EXPOSE 10000
+
+# ---- Run the FastAPI app ----
+CMD ["sh", "-c", "uvicorn main:app --host 0.0.0.0 --port ${PORT:-8000}"]
