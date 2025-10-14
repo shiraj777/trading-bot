@@ -5,12 +5,24 @@ from services.policy import decide
 from services.risk import position_size
 from services.utils import SignalResponse
 
+# יצירת האפליקציה הראשית
 app = FastAPI(title="Trading Bot API", version="0.1.0")
 
+# ✅ נתיב בריאות עבור Render
+@app.get("/healthz")
+def health_check():
+    """
+    Endpoint for Render health checks.
+    Returns 200 OK if the service is alive.
+    """
+    return {"status": "ok"}
+
+# נתיב בדיקה ראשי
 @app.get("/")
 def root():
     return {"status": "ok", "service": "Trading Bot API"}
 
+# יצירת אות מסחר
 @app.get("/signals/{ticker}", response_model=SignalResponse)
 def get_signal(
     ticker: str,
@@ -45,7 +57,7 @@ def get_signal(
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
-# DEBUG ONLY (optional): inspect raw columns coming from yfinance
+# DEBUG ONLY (optional): inspect raw columns from yfinance
 @app.get("/debug/cols/{ticker}")
 def debug_columns(ticker: str, period: str = "6mo", interval: str = "1d"):
     import yfinance as yf
