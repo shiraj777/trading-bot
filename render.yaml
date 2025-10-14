@@ -1,13 +1,33 @@
+# ============================
+# Render Deployment Blueprint
+# ============================
+
 services:
   - type: web
     name: trading-bot
     env: docker
     plan: free
+
+    # Render יבנה לפי ה־Dockerfile שלך
     autoDeploy: true
-    healthCheckPath: /healthz
-    dockerfilePath: ./Dockerfile
+    branch: main
+
+    # כתובת בריאות (Health Check)
+    healthCheckPath: /
+
+    # משתני סביבה
     envVars:
-      - key: ENV
+      - key: ENVIRONMENT
         value: production
       - key: PORT
         value: 8000
+      - key: PYTHONUNBUFFERED
+        value: "1"
+      - key: PYTHONDONTWRITEBYTECODE
+        value: "1"
+      - key: PYTHON_VERSION
+        value: 3.11
+
+    # שמירה על זמני Build קצרים
+    buildCommand: ""
+    startCommand: ""
