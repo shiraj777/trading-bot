@@ -1,0 +1,13 @@
+services:
+  - type: web
+    name: trading-bot
+    env: docker
+    plan: free
+    autoDeploy: true
+    healthCheckPath: /healthz
+    dockerfilePath: ./Dockerfile
+    envVars:
+      - key: ENV
+        value: production
+      - key: PORT
+        value: 8000
