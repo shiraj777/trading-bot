@@ -1,7 +1,4 @@
-# render.yaml
-
 services:
-  # שירות WEB (אם יש FastAPI / Flask)
   - type: web
     name: trading-bot
     env: docker
@@ -15,7 +12,6 @@ services:
       - key: PORT
         value: 8000
 
-  # Worker שמריץ את הקוד של הבוט ברקע
   - type: worker
     name: trading-bot-worker
     env: docker
