@@ -1,14 +1,29 @@
-IMAGE=trading-bot
-PORT=8000
+# ==========================
+# Trading Bot - Makefile
+# ==========================
 
-docker-build:
-	docker build -t $(IMAGE) .
+# הפעלת השרת לוקאלית עם FastAPI + Uvicorn
+run:
+	source .venv/bin/activate && uvicorn main:app --reload
 
-docker-run:
-	docker run --rm -d -p $(PORT):8000 --name $(IMAGE) $(IMAGE)
+# התקנת כל התלויות (כולל FastAPI ו-Uvicorn)
+install:
+	python3 -m venv .venv && source .venv/bin/activate && pip install --upgrade pip && pip install -r requirements.txt fastapi uvicorn
 
-docker-stop:
-	- docker rm -f $(IMAGE) || true
+# בדיקה שהכול תקין
+check:
+	@echo "Python version:" && python3 --version
+	@echo "FastAPI version:" && python3 -m pip show fastapi | grep Version || echo "FastAPI not installed"
+	@echo "Uvicorn version:" && python3 -m pip show uvicorn | grep Version || echo "Uvicorn not installed"
 
-docker-test:
-	curl -sSf http://127.0.0.1:$(PORT)/healthz | grep -q '"status":"ok"' && echo "✅ Health OK" || (echo "❌ Health check FAILED" && exit 1)
+# ניקוי קבצי cache
+clean:
+	find . -type d -name "__pycache__" -exec rm -rf {} +
+	find . -type f -name "*.pyc" -delete
+
+# העלאת קוד ל־GitHub + דיפלוי אוטומטי ל־Render
+deploy:
+	git add .
+	git commit -m "Auto-deploy update"
+	git push origin main
+	@echo "🚀 Deployment triggered on Render!"

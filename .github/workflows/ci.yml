@@ -1,0 +1,44 @@
+name: CI - build & healthcheck
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+jobs:
+  build-and-test:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build image (no cache)
+        run: |
+          docker build --no-cache --pull -t trading-bot:ci .
+
+      - name: Run container
+        run: |
+          docker run -d --name tb -p 8000:8000 trading-bot:ci
+
+      - name: Wait for /healthz (up to 90s)
+        run: |
+          for i in $(seq 1 90); do
+            if curl -fsS http://127.0.0.1:8000/healthz >/dev/null 2>&1; then
+              echo "healthy after ${i}s"; exit 0
+            fi
+            sleep 1
+          done
+          echo "healthz FAILED"; docker logs tb || true; exit 1
+
+      - name: Smoke test (signals)
+        run: |
+          curl -fsS "http://127.0.0.1:8000/signals/AAPL?period=1mo&interval=1d&equity=10000&risk_pct=0.02" | head -c 600
+
+      - name: Cleanup
+        if: always()
+        run: docker rm -f tb || true
