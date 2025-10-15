@@ -1,9 +1,7 @@
 # render.yaml
 
 services:
-  # ------------------------------
-  # שירות Web (אם יש לך FastAPI/Flask)
-  # ------------------------------
+  # שירות WEB (אם יש FastAPI / Flask)
   - type: web
     name: trading-bot
     env: docker
@@ -17,20 +15,14 @@ services:
       - key: PORT
         value: 8000
 
-  # ------------------------------
-  # Worker רץ ברקע 24/7
-  # ------------------------------
+  # Worker שמריץ את הקוד של הבוט ברקע
   - type: worker
     name: trading-bot-worker
     env: docker
     plan: free
     autoDeploy: true
     branch: main
-
-    # זה הפקודה שה-Worker יריץ
     dockerCommand: python run_worker.py
-
-    # משתני סביבה - ניתן לשנות דרך Render Dashboard
     envVars:
       - key: PAPER
         value: "true"
@@ -48,8 +40,6 @@ services:
         value: "0.01"
       - key: LOG_LEVEL
         value: "INFO"
-
-      # ספים למדיניות (כדי לראות פעולות)
       - key: RSI_BUY
         value: "55"
       - key: RSI_SELL
