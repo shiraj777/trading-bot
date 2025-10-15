@@ -1,33 +1,62 @@
-# ============================
-# Render Deployment Blueprint
-# ============================
+# render.yaml
 
 services:
+  # ------------------------------
+  # שירות Web (אם יש לך FastAPI/Flask)
+  # ------------------------------
   - type: web
     name: trading-bot
     env: docker
     plan: free
+    autoDeploy: true
+    branch: main
+    healthCheckPath: /
+    envVars:
+      - key: LOG_LEVEL
+        value: INFO
+      - key: PORT
+        value: 8000
 
-    # Render יבנה לפי ה־Dockerfile שלך
+  # ------------------------------
+  # Worker רץ ברקע 24/7
+  # ------------------------------
+  - type: worker
+    name: trading-bot-worker
+    env: docker
+    plan: free
     autoDeploy: true
     branch: main
 
-    # כתובת בריאות (Health Check)
-    healthCheckPath: /
+    # זה הפקודה שה-Worker יריץ
+    dockerCommand: python run_worker.py
 
-    # משתני סביבה
+    # משתני סביבה - ניתן לשנות דרך Render Dashboard
     envVars:
-      - key: ENVIRONMENT
-        value: production
-      - key: PORT
-        value: 8000
-      - key: PYTHONUNBUFFERED
-        value: "1"
-      - key: PYTHONDONTWRITEBYTECODE
-        value: "1"
-      - key: PYTHON_VERSION
-        value: 3.11
+      - key: PAPER
+        value: "true"
+      - key: TICKER
+        value: "AAPL"
+      - key: PERIOD
+        value: "1mo"
+      - key: INTERVAL
+        value: "30m"
+      - key: POLL_INTERVAL
+        value: "15"
+      - key: EQUITY
+        value: "10000"
+      - key: RISK_PCT
+        value: "0.01"
+      - key: LOG_LEVEL
+        value: "INFO"
 
-    # שמירה על זמני Build קצרים
-    buildCommand: ""
-    startCommand: ""
+      # ספים למדיניות (כדי לראות פעולות)
+      - key: RSI_BUY
+        value: "55"
+      - key: RSI_SELL
+        value: "45"
+      - key: MACD_HIST_BUY
+        value: "0.0"
+      - key: MACD_HIST_SELL
+        value: "0.0"
+      - key: MIN_SCORE
+        value: "0.0"
