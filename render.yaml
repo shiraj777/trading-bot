@@ -1,48 +1,49 @@
+# ============================
+# Render Deployment Blueprint
+# ============================
+
 services:
+  # --- Public Web API (FastAPI) ---
   - type: web
     name: trading-bot
     env: docker
-    plan: free
+    plan: free                 # נשאר בחינם ל־API
     autoDeploy: true
     branch: main
     healthCheckPath: /
     envVars:
+      - key: PYTHON_VERSION
+        value: 3.11
       - key: LOG_LEVEL
-        value: INFO
+        value: info
       - key: PORT
         value: 8000
 
+  # --- Background Worker (24/7) ---
   - type: worker
     name: trading-bot-worker
     env: docker
-    plan: free
+    plan: starter              # נדרש Worker בתשלום (Starter $7/חודש)
     autoDeploy: true
     branch: main
-    dockerCommand: python run_worker.py
+    # מריץ את הסקריפט של הלופר
+    startCommand: python run_worker.py
+
+    # ברירות מחדל בטוחות — אפשר לשנות בהמשך ממשק Render או פה
     envVars:
       - key: PAPER
-        value: "true"
+        value: "true"          # מסחר על נייר בלבד
       - key: TICKER
-        value: "AAPL"
+        value: AAPL
       - key: PERIOD
-        value: "1mo"
+        value: 1mo
       - key: INTERVAL
-        value: "30m"
+        value: 30m
       - key: POLL_INTERVAL
-        value: "15"
+        value: "30"
       - key: EQUITY
         value: "10000"
       - key: RISK_PCT
         value: "0.01"
       - key: LOG_LEVEL
-        value: "INFO"
-      - key: RSI_BUY
-        value: "55"
-      - key: RSI_SELL
-        value: "45"
-      - key: MACD_HIST_BUY
-        value: "0.0"
-      - key: MACD_HIST_SELL
-        value: "0.0"
-      - key: MIN_SCORE
-        value: "0.0"
+        value: info
