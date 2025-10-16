@@ -1,117 +1,113 @@
 # services/execution.py
 from __future__ import annotations
-import os, json, logging
-from dataclasses import dataclass
-import requests
 
-log = logging.getLogger("execution")
+import json
+import os
+from dataclasses import dataclass
+from typing import Optional
+
+import urllib.request
+import urllib.error
+
 
 @dataclass
 class OrderResult:
     ok: bool
-    id: str | None = None
-    status: str | None = None
-    filled_qty: float | None = None
-    avg_price: float | None = None
-    error: str | None = None
+    id: Optional[str] = None
+    status: Optional[str] = None
+    filled_qty: Optional[str] = None
+    avg_price: Optional[str] = None
+    error: Optional[str] = None
 
+
+# -------------------- Paper (סימולציה) --------------------
 class PaperBroker:
-    """ברוקר סימולטיבי (לוג בלבד)."""
     def __init__(self, paper: bool = True):
         self.paper = paper
 
-    def place_order(self, symbol: str, side: str, qty: float, price: float, stop: float, take: float) -> OrderResult:
-        log.info("[PAPER %s] %s %s @%.2f (stop=%.2f take=%.2f)",
-                 "BUY" if side=="buy" else "SELL", qty, symbol, price, stop, take)
-        return OrderResult(ok=True, id="paper-sim", status="accepted", filled_qty=0.0, avg_price=None)
+    def place_order(
+        self, symbol: str, side: str, qty: int, price: float, stop: float, take: float
+    ) -> OrderResult:
+        # סימולציה בלבד – כאילו בוצע
+        return OrderResult(ok=True, id="paper-sim", status="accepted",
+                           filled_qty="0", avg_price=str(price))
 
+
+# -------------------- Alpaca --------------------
 class AlpacaBroker:
     """
-    ברוקר Alpaca.
-    אפשר להעביר key_id/secret_key/ base בבנאי, ואם לא – נלקח מה-ENV:
-      ALPACA_KEY_ID / APCA_API_KEY_ID
-      ALPACA_SECRET_KEY / APCA_API_SECRET_KEY
-      ALPACA_BASE_URL (או ברירת מחדל לפי paper)
+    Broker ל-Alpaca. קורא ישירות ל-REST API עם urllib (בלי תלות חיצונית).
+    תומך ב-base_url, key_id, secret_key (עם ברירת־מחדל מ-env).
     """
+
     def __init__(
         self,
         paper: bool = True,
-        key_id: str | None = None,
-        secret_key: str | None = None,
-        base: str | None = None,
-        allow_short: bool = False,
+        key_id: Optional[str] = None,
+        secret_key: Optional[str] = None,
+        base_url: Optional[str] = None,
     ):
         self.paper = paper
-        self.allow_short = allow_short
+        self.key_id = key_id or os.getenv("ALPACA_KEY_ID") or ""
+        self.secret_key = secret_key or os.getenv("ALPACA_SECRET_KEY") or ""
+        # שימי לב: אנחנו שומרים את הבסיס בלי '/' בסוף
+        default_base = os.getenv("ALPACA_BASE_URL", "https://paper-api.alpaca.markets")
+        self.base = (base_url or default_base).rstrip("/")
 
-        # בסיס URL
-        self.base = (
-            base
-            or os.getenv("ALPACA_BASE_URL")
-            or ("https://paper-api.alpaca.markets" if paper else "https://api.alpaca.markets")
-        )
-
-        # מפתחות
-        self.key_id = key_id or os.getenv("ALPACA_KEY_ID") or os.getenv("APCA_API_KEY_ID")
-        self.secret_key = secret_key or os.getenv("ALPACA_SECRET_KEY") or os.getenv("APCA_API_SECRET_KEY")
         if not self.key_id or not self.secret_key:
-            raise RuntimeError("Missing Alpaca API keys (ALPACA_KEY_ID / ALPACA_SECRET_KEY)")
+            raise ValueError("ALPACA_KEY_ID / ALPACA_SECRET_KEY not provided")
 
-        self.session = requests.Session()
-        self.session.headers.update({
+    # url /v2/orders – גם אם כתבו base עם/בלי /v2
+    def _orders_url(self) -> str:
+        if self.base.endswith("/v2"):
+            return f"{self.base}/orders"
+        return f"{self.base}/v2/orders"
+
+    def _headers(self) -> dict:
+        return {
             "APCA-API-KEY-ID": self.key_id,
             "APCA-API-SECRET-KEY": self.secret_key,
-            "Accept": "application/json",
             "Content-Type": "application/json",
-        })
-        log.info("AlpacaBroker initialized (paper=%s, base=%s)", self.paper, self.base)
+        }
 
-    def _url(self, path: str) -> str:
-        return f"{self.base}{path}"
+    def place_order(
+        self, symbol: str, side: str, qty: int, price: float, stop: float, take: float
+    ) -> OrderResult:
+        url = self._orders_url()
 
-    def place_order(self, symbol: str, side: str, qty: float, price: float, stop: float, take: float) -> OrderResult:
-        """
-        שולח הזמנה Market/Day פשוטה. (את ה-stop/take אנחנו לא מצרפים כאן כדי להימנע מ-403 ‘wash trade’/ניגוד)
-        """
-        # הגנה בסיסית: לא לאפשר short אם כבוי
-        if side == "sell" and not self.allow_short:
-            # אם אין פוזיציה – Reject “שורט”
-            try:
-                pos = self.session.get(self._url(f"/v2/positions/{symbol}")).json()
-                if "symbol" not in pos:  # אין פוזיציה פתוחה
-                    return OrderResult(ok=False, error="short not allowed and no long position to close")
-            except Exception:
-                pass  # אם נכשל – ניתן לאלפאקה להחליט
-
-        url = self._url("/v2/orders")
-        data = {
+        # הזמנה בסיסית (Market, DAY). אם יש גם stop וגם take – נשתמש ב-bracket.
+        payload: dict = {
             "symbol": symbol,
-            "qty": max(1, int(qty)),
-            "side": "buy" if side == "buy" else "sell",
+            "qty": qty,
+            "side": side,           # "buy" / "sell"
             "type": "market",
             "time_in_force": "day",
         }
 
-        try:
-            r = self.session.post(url, data=json.dumps(data), timeout=10)
-            if r.status_code >= 400:
-                # דוגמאות נפוצות: 401/403, wash-trade וכו׳
-                try:
-                    body = r.json()
-                except Exception:
-                    body = {"message": r.text}
-                msg = body.get("message") or body
-                log.warning("execution:alpaca order failed: HTTP %s: %s", r.status_code, msg)
-                return OrderResult(ok=False, error=f"HTTP {r.status_code}: {msg}")
+        if stop and take and stop > 0 and take > 0:
+            payload["order_class"] = "bracket"
+            payload["take_profit"] = {"limit_price": round(float(take), 4)}
+            payload["stop_loss"] = {"stop_price": round(float(stop), 4)}
 
-            body = r.json()
-            return OrderResult(
-                ok=True,
-                id=body.get("id"),
-                status=body.get("status"),
-                filled_qty=float(body.get("filled_qty") or 0.0),
-                avg_price=(float(body.get("filled_avg_price")) if body.get("filled_avg_price") else None),
-            )
+        data = json.dumps(payload).encode("utf-8")
+        req = urllib.request.Request(url, data=data, headers=self._headers(), method="POST")
+
+        try:
+            with urllib.request.urlopen(req, timeout=30) as resp:
+                body = resp.read().decode("utf-8")
+                obj = json.loads(body)
+                return OrderResult(
+                    ok=True,
+                    id=obj.get("id"),
+                    status=obj.get("status"),
+                    filled_qty=obj.get("filled_qty"),
+                    avg_price=obj.get("filled_avg_price"),
+                )
+        except urllib.error.HTTPError as e:
+            try:
+                err_body = e.read().decode("utf-8")
+            except Exception:
+                err_body = str(e)
+            return OrderResult(ok=False, error=f"HTTP {e.code}: {err_body}")
         except Exception as e:
-            log.exception("alpaca request failed (POST /v2/orders)")
             return OrderResult(ok=False, error=str(e))

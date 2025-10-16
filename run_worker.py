@@ -3,16 +3,12 @@ from __future__ import annotations
 import os, time, logging
 from datetime import datetime
 
-from dotenv import load_dotenv  # לוקאלי: טוען .env (ברנדר לא חובה)
 from services.data import fetch_bars
 from services.indicators import add_indicators
 from services.policy import decide
 from services.risk import position_size
 from services import alerts
 from services.execution import PaperBroker, AlpacaBroker
-
-# ---------- load .env locally (safe no-op in Render) ----------
-load_dotenv()
 
 # ---------- logging ----------
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
@@ -22,8 +18,7 @@ logging.basicConfig(
 )
 log = logging.getLogger("worker")
 
-
-# ---------- helpers ----------
+# ---------- env ----------
 def _env(name: str, default: str) -> str:
     v = os.getenv(name)
     return default if v is None or v == "" else v
@@ -37,8 +32,6 @@ def _env_float(name: str, default: float) -> float:
     except ValueError:
         return default
 
-
-# ---------- config from env ----------
 PAPER         = _env("PAPER", "true").lower() == "true"
 TICKER        = _env("TICKER", "AAPL")
 PERIOD        = _env("PERIOD", "1mo")
@@ -47,37 +40,29 @@ POLL_INTERVAL = _env_float("POLL_INTERVAL", 30.0)
 EQUITY        = _env_float("EQUITY", 10_000.0)
 RISK_PCT      = _env_float("RISK_PCT", 0.01)
 
+# חדש: לאפשר/למנוע פתיחת שורט אם אין לונג
+ALLOW_SHORT   = _env("ALLOW_SHORT", "false").lower() == "true"
+
 SERVICE_NAME  = "trading-bot-worker"
 
-# ---------- Alpaca creds pulled explicitly and passed to broker ----------
-ALPACA_API_KEY    = os.getenv("ALPACA_API_KEY") or os.getenv("ALPACA_KEY_ID") or ""
-ALPACA_API_SECRET = os.getenv("ALPACA_API_SECRET") or os.getenv("ALPACA_SECRET_KEY") or ""
-ALPACA_BASE_URL   = (os.getenv("ALPACA_BASE_URL") or "https://paper-api.alpaca.markets").strip()
-# normalize base url (no trailing slash, no /v2)
-ALPACA_BASE_URL   = ALPACA_BASE_URL.rstrip("/")
-if ALPACA_BASE_URL.endswith("/v2"):
-    ALPACA_BASE_URL = ALPACA_BASE_URL[:-3]
-ALPACA_PAPER      = (os.getenv("ALPACA_PAPER", "true").lower() == "true")
-
+# בתוך run_worker.py
 
 def _make_broker():
-    """
-    אם יש מפתחות Alpaca — נשתמש ב-AlpacaBroker עם הזרמת הפרמטרים ישירות.
-    אחרת — PaperBroker בלבד (סימולציה).
-    """
-    if ALPACA_API_KEY and ALPACA_API_SECRET:
-        log.info("Using Alpaca broker (paper=%s, base=%s)", ALPACA_PAPER, ALPACA_BASE_URL)
+    if os.getenv("ALPACA_KEY_ID") and os.getenv("ALPACA_SECRET_KEY"):
+        paper = os.getenv("ALPACA_PAPER", "true").lower() == "true"
+        base  = os.getenv("ALPACA_BASE_URL", "https://paper-api.alpaca.markets")
+        log.info("Using Alpaca broker (paper=%s, base=%s)", paper, base)
         return AlpacaBroker(
-            paper=ALPACA_PAPER,
-            key_id=ALPACA_API_KEY,
-            secret_key=ALPACA_API_SECRET,
-            base_url=ALPACA_BASE_URL,
+            paper=paper,
+            key_id=os.getenv("ALPACA_KEY_ID"),
+            secret_key=os.getenv("ALPACA_SECRET_KEY"),
+            base_url=base,        # << זה השם הנכון שה-class מקבל
         )
     log.info("Using Paper broker (simulated)")
     return PaperBroker(paper=True)
 
-BROKER = _make_broker()
 
+BROKER = _make_broker()
 
 def describe_row(row) -> str:
     parts = []
@@ -91,38 +76,69 @@ def describe_row(row) -> str:
     add("macd_signal", "{:.3f}"); add("macd_hist", "{:.3f}"); add("atr", "{:.3f}")
     return ", ".join(parts)
 
-
 def once():
     raw = fetch_bars(TICKER, period=PERIOD, interval=INTERVAL)
     df  = add_indicators(raw)
     if df is None or df.empty or len(df) < 20:
         raise ValueError("Not enough data after indicators.")
     last = df.iloc[-1]
-    dec  = decide(df)  # dec.side in {"buy","sell","hold"}, dec.score, dec.reason
 
+    dec  = decide(df)  # dec.side in {"buy","sell","hold"}, dec.score, dec.reason
     price = float(last.get("close"))
     atr   = float(last.get("atr", 0.0))
     qty, stop, take = position_size(equity=EQUITY, atr=atr, price=price, risk_pct=RISK_PCT)
 
-    stamp = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
-    log.info("[%s] %s | %s | decision=%s score=%.3f reason=\"%s\" | size=%s stop=%.4f take=%.4f",
-             stamp, TICKER, describe_row(last), dec.side, float(dec.score), dec.reason,
-             qty, stop, take)
+    # מה הפוזיציה הנוכחית?
+    try:
+        pos_qty = float(BROKER.position_qty(TICKER))
+    except Exception:
+        pos_qty = 0.0
 
-    # Heartbeat (אחת לכמה דקות לפי HEARTBEAT_EVERY)
+    # לוגיקה כדי למנוע SELL אם אין לונג (אלא אם ALLOW_SHORT=true)
+    can_send   = False
+    order_side = None
+    reason_ex  = ""
+
+    if dec.side == "buy":
+        # אם אין לונג (pos<=0) נקנה; אם יש שורט (pos<0) זה מכסה אותו.
+        if pos_qty <= 0:
+            can_send   = True
+            order_side = "buy"
+            if pos_qty < 0:
+                reason_ex = " (cover short)"
+    elif dec.side == "sell":
+        if pos_qty > 0:
+            # יש לונג – מוכרים (סגירה/הקטנה)
+            can_send   = True
+            order_side = "sell"
+        elif ALLOW_SHORT:
+            # אין לונג – מותר לפתוח שורט
+            can_send   = True
+            order_side = "sell"
+            reason_ex  = " (open short)"
+        else:
+            can_send = False
+    else:
+        can_send = False
+
+    stamp = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
+    log.info("[%s] %s | %s | decision=%s score=%.3f reason=\"%s\" pos=%s | size=%s stop=%.4f take=%.4f",
+             stamp, TICKER, describe_row(last), dec.side, float(dec.score), dec.reason,
+             pos_qty, qty, stop, take)
+
+    # Heartbeat
     alerts.maybe_heartbeat(SERVICE_NAME)
 
-    if dec.side in ("buy", "sell") and qty > 0:
-        # שליחת פקודה לברוקר
-        res = BROKER.place_order(TICKER, dec.side, qty, price, stop, take)
+    if can_send and order_side and qty > 0:
+        res = BROKER.place_order(TICKER, order_side, qty, price, stop, take)
         if res.ok:
-            alerts.notify_trade(dec.side, TICKER, qty, price, stop, take, dec.reason, paper=BROKER.paper)
+            alerts.notify_trade(order_side, TICKER, qty, price, stop, take,
+                                dec.reason + reason_ex, paper=BROKER.paper)
             log.info("order ok id=%s status=%s filled=%s avg=%s", res.id, res.status, res.filled_qty, res.avg_price)
         else:
-            alerts.notify_error(f"order failed for {dec.side} {TICKER} x{qty}", Exception(res.error or "order error"))
+            alerts.notify_error(f"order failed for {order_side} {TICKER} x{qty}", Exception(res.error or "order error"))
     else:
-        log.debug("nothing to do")
-
+        log.debug("skip: decision=%s pos=%s allow_short=%s", dec.side, pos_qty, ALLOW_SHORT)
 
 def main():
     alerts.notify_start(SERVICE_NAME, paper=PAPER, ticker=TICKER, interval=INTERVAL)
@@ -137,7 +153,6 @@ def main():
             log.exception("iteration failed")
             alerts.notify_error("iteration failed", e)
         time.sleep(POLL_INTERVAL)
-
 
 if __name__ == "__main__":
     try:
