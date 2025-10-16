@@ -1,29 +1,29 @@
 # run_worker.py
 from __future__ import annotations
-
-import os
-import time
-import logging
+import os, time, logging
 from datetime import datetime
-from typing import Tuple
 
+from dotenv import load_dotenv  # לוקאלי: טוען .env (ברנדר לא חובה)
 from services.data import fetch_bars
 from services.indicators import add_indicators
 from services.policy import decide
 from services.risk import position_size
+from services import alerts
+from services.execution import PaperBroker, AlpacaBroker
 
-# חדש: התראות טלגרם
-from services.alerts import get_alerter
+# ---------- load .env locally (safe no-op in Render) ----------
+load_dotenv()
 
 # ---------- logging ----------
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
 logging.basicConfig(
     level=getattr(logging, LOG_LEVEL, logging.INFO),
-    format="%(levelname)s:%(name)s:%(message)s"
+    format="%(asctime)s %(levelname)s:%(name)s:%(message)s",
 )
 log = logging.getLogger("worker")
 
-# ---------- config from env with defaults ----------
+
+# ---------- helpers ----------
 def _env(name: str, default: str) -> str:
     v = os.getenv(name)
     return default if v is None or v == "" else v
@@ -37,20 +37,49 @@ def _env_float(name: str, default: float) -> float:
     except ValueError:
         return default
 
+
+# ---------- config from env ----------
 PAPER         = _env("PAPER", "true").lower() == "true"
 TICKER        = _env("TICKER", "AAPL")
-PERIOD        = _env("PERIOD", "1mo")          # דוגמה: 6mo / 3mo / 1mo / ytd
-INTERVAL      = _env("INTERVAL", "30m")        # דוגמה: 1d / 1h / 30m / 15m
+PERIOD        = _env("PERIOD", "1mo")
+INTERVAL      = _env("INTERVAL", "30m")
 POLL_INTERVAL = _env_float("POLL_INTERVAL", 30.0)
 EQUITY        = _env_float("EQUITY", 10_000.0)
-RISK_PCT      = _env_float("RISK_PCT", 0.01)   # 1% ברירת מחדל
+RISK_PCT      = _env_float("RISK_PCT", 0.01)
 
-# אובייקט ההתראות (סינגלטון)
-alerter = get_alerter()
+SERVICE_NAME  = "trading-bot-worker"
+
+# ---------- Alpaca creds pulled explicitly and passed to broker ----------
+ALPACA_API_KEY    = os.getenv("ALPACA_API_KEY") or os.getenv("ALPACA_KEY_ID") or ""
+ALPACA_API_SECRET = os.getenv("ALPACA_API_SECRET") or os.getenv("ALPACA_SECRET_KEY") or ""
+ALPACA_BASE_URL   = (os.getenv("ALPACA_BASE_URL") or "https://paper-api.alpaca.markets").strip()
+# normalize base url (no trailing slash, no /v2)
+ALPACA_BASE_URL   = ALPACA_BASE_URL.rstrip("/")
+if ALPACA_BASE_URL.endswith("/v2"):
+    ALPACA_BASE_URL = ALPACA_BASE_URL[:-3]
+ALPACA_PAPER      = (os.getenv("ALPACA_PAPER", "true").lower() == "true")
+
+
+def _make_broker():
+    """
+    אם יש מפתחות Alpaca — נשתמש ב-AlpacaBroker עם הזרמת הפרמטרים ישירות.
+    אחרת — PaperBroker בלבד (סימולציה).
+    """
+    if ALPACA_API_KEY and ALPACA_API_SECRET:
+        log.info("Using Alpaca broker (paper=%s, base=%s)", ALPACA_PAPER, ALPACA_BASE_URL)
+        return AlpacaBroker(
+            paper=ALPACA_PAPER,
+            key_id=ALPACA_API_KEY,
+            secret_key=ALPACA_API_SECRET,
+            base_url=ALPACA_BASE_URL,
+        )
+    log.info("Using Paper broker (simulated)")
+    return PaperBroker(paper=True)
+
+BROKER = _make_broker()
 
 
 def describe_row(row) -> str:
-    """Build a short string with last indicators (if exist)."""
     parts = []
     def add(name, fmt="{:.4f}"):
         if name in row:
@@ -58,111 +87,55 @@ def describe_row(row) -> str:
                 parts.append(f"{name}=" + (fmt.format(float(row[name]))))
             except Exception:
                 parts.append(f"{name}=?")
-    add("close")
-    add("rsi", "{:.1f}")
-    add("macd", "{:.3f}")
-    add("macd_signal", "{:.3f}")
-    add("macd_hist", "{:.3f}")
-    add("atr", "{:.3f}")
+    add("close"); add("rsi", "{:.1f}"); add("macd", "{:.3f}")
+    add("macd_signal", "{:.3f}"); add("macd_hist", "{:.3f}"); add("atr", "{:.3f}")
     return ", ".join(parts)
 
 
-def _size_from_row(last) -> Tuple[float, float, float]:
-    """מחשב גודל פוזיציה, סטופ וטייק מהשורה האחרונה של הדאטה"""
-    price = float(last.get("close"))
-    atr   = float(last.get("atr", 0.0))
-    qty, stop, take = position_size(
-        equity=EQUITY, atr=atr, price=price, risk_pct=RISK_PCT
-    )
-    return qty, stop, take
-
-
-def _maybe_notify_trade(dec, last, qty, stop, take) -> None:
-    """
-    שולח התראת עסקה במקרה של BUY/SELL.
-    (כרגע ההרצה היא PAPER בלבד, לכן זה רק התראה + לוג)
-    """
-    if dec.side not in ("buy", "sell") or qty <= 0:
-        return
-
-    price = float(last.get("close"))
-    alerter.notify_trade(
-        side=dec.side,
-        ticker=TICKER,
-        price=price,
-        qty=qty,
-        score=float(dec.score),
-        reason=dec.reason,
-        stop=stop,
-        take=take,
-    )
-
-    if PAPER:
-        log.info(
-            "PAPER TRADE: %s %s @ ~%.4f (qty=%s, stop=%.4f, take=%.4f)",
-            dec.side.upper(), TICKER, price, qty, stop, take
-        )
-    else:
-        # כאן בהמשך ייכנס הקוד לחיבור לברוקר אמיתי
-        log.warning("LIVE TRADE (not implemented): %s %s qty=%s", dec.side, TICKER, qty)
-
-
 def once():
-    """
-    Single polling iteration:
-    1) fetch -> add indicators
-    2) decision
-    3) size calc (qty/stop/take)
-    4) paper 'execution' (log) + הודעת טלגרם
-    """
     raw = fetch_bars(TICKER, period=PERIOD, interval=INTERVAL)
     df  = add_indicators(raw)
-
     if df is None or df.empty or len(df) < 20:
-        raise ValueError("Not enough data for decision after indicators.")
-
+        raise ValueError("Not enough data after indicators.")
     last = df.iloc[-1]
-    dec  = decide(df)
-    qty, stop, take = _size_from_row(last)
+    dec  = decide(df)  # dec.side in {"buy","sell","hold"}, dec.score, dec.reason
 
-    # DEBUG summary
+    price = float(last.get("close"))
+    atr   = float(last.get("atr", 0.0))
+    qty, stop, take = position_size(equity=EQUITY, atr=atr, price=price, risk_pct=RISK_PCT)
+
     stamp = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
-    log.info(
-        "[%s] %s | %s | decision=%s score=%.3f reason=\"%s\" | size=%s stop=%.4f take=%.4f",
-        stamp, TICKER, describe_row(last), dec.side, float(dec.score), dec.reason,
-        qty, stop, take
-    )
+    log.info("[%s] %s | %s | decision=%s score=%.3f reason=\"%s\" | size=%s stop=%.4f take=%.4f",
+             stamp, TICKER, describe_row(last), dec.side, float(dec.score), dec.reason,
+             qty, stop, take)
 
-    # שליחת התראת עסקה אם צריך
-    _maybe_notify_trade(dec, last, qty, stop, take)
+    # Heartbeat (אחת לכמה דקות לפי HEARTBEAT_EVERY)
+    alerts.maybe_heartbeat(SERVICE_NAME)
+
+    if dec.side in ("buy", "sell") and qty > 0:
+        # שליחת פקודה לברוקר
+        res = BROKER.place_order(TICKER, dec.side, qty, price, stop, take)
+        if res.ok:
+            alerts.notify_trade(dec.side, TICKER, qty, price, stop, take, dec.reason, paper=BROKER.paper)
+            log.info("order ok id=%s status=%s filled=%s avg=%s", res.id, res.status, res.filled_qty, res.avg_price)
+        else:
+            alerts.notify_error(f"order failed for {dec.side} {TICKER} x{qty}", Exception(res.error or "order error"))
+    else:
+        log.debug("nothing to do")
 
 
 def main():
-    # הודעת סטארט לטלגרם
-    alerter.notify_start(
-        service_name="trading-bot",
-        paper=PAPER,
-        ticker=TICKER,
-        interval=INTERVAL,
-        extra={"period": PERIOD}
-    )
-
-    log.info(
-        "Starting worker polling %s every %s s (PAPER=%s, PERIOD=%s, INTERVAL=%s)",
-        TICKER, POLL_INTERVAL, PAPER, PERIOD, INTERVAL
-    )
-
+    alerts.notify_start(SERVICE_NAME, paper=PAPER, ticker=TICKER, interval=INTERVAL)
+    log.info("Starting worker polling %s every %.0f s (PAPER=%s, PERIOD=%s, INTERVAL=%s)",
+             TICKER, POLL_INTERVAL, PAPER, PERIOD, INTERVAL)
     while True:
         try:
             once()
-            # פעימת חיים (רק אם HEARTBEAT_EVERY>0 הוגדר בסביבה)
-            alerter.maybe_heartbeat("worker alive")
         except KeyboardInterrupt:
             raise
         except Exception as e:
-            # לוג + התראת שגיאה לטלגרם
-            log.error("iteration failed: %s", e)
-            alerter.notify_error(str(e))
+            log.exception("iteration failed")
+            alerts.notify_error("iteration failed", e)
         time.sleep(POLL_INTERVAL)
 
 
