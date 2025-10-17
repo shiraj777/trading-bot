@@ -6,7 +6,6 @@ from dataclasses import dataclass
 from typing import Optional, Dict, Any
 
 import requests
-
 from services.alpaca_client import AlpacaClient
 
 
@@ -70,7 +69,7 @@ class PaperBroker:
             sl = entry_price * (1 + sl_pct)  # SL בסל=עליה
         self._apply_pos(symbol, side, qty)
         self.log.info(
-            "[SIM] BRACKET %s %s x%s @%.4f | tp=%.4f sl=%.4f (tp%%=%.3f sl%%=%.3f)",
+            "[SIM] BRACKET %s %s x%s @%.4f | tp=%.2f sl=%.2f (tp%%=%.3f sl%%=%.3f)",
             side, symbol, qty, entry_price, tp, sl, tp_pct*100, sl_pct*100
         )
         return ExecResult(ok=True, id="sim-bracket-1", status="accepted",
@@ -108,24 +107,18 @@ class AlpacaBroker:
         """
         try:
             data = self.client._get(f"positions/{symbol.upper()}")
-            # אם יש, זה אובייקט יחיד
             qty = float(data.get("qty", 0.0))
             return qty
         except requests.HTTPError as e:
-            # אם אין פוזיציה, Alpaca מחזירה 404
             if e.response is not None and e.response.status_code == 404:
                 return 0.0
             raise
 
-    # --------- MARKET (הקיים) ---------
+    # --------- MARKET ---------
     def place_order(
         self, symbol: str, side: str, qty: int,
         price: float, stop: float, take: float
     ) -> ExecResult:
-        """
-        פקודת MARKET רגילה (אפשר להרחיב ל-limit וכו'). כאן נשמרת התנהגות הפלאגין
-        ההיסטורי – הנתונים stop/take רק ללוג/התראה, Alpaca לא מקבלם ב-MARKET.
-        """
         payload = {
             "symbol": symbol.upper(),
             "qty": str(qty),
@@ -134,9 +127,7 @@ class AlpacaBroker:
             "time_in_force": "day",
         }
         try:
-            self.log.info(
-                "Alpaca MARKET submit: %s", payload
-            )
+            self.log.info("Alpaca MARKET submit: %s", payload)
             data = self.client._post("orders", json=payload)
             return ExecResult(
                 ok=True,
@@ -161,10 +152,7 @@ class AlpacaBroker:
         sl_pct: float,
     ) -> ExecResult:
         """
-        שולח הזמנת BRACKET ל-Alpaca:
-        - BUY: take_profit.limit_price > stop_loss.stop_price
-        - SELL: take_profit.limit_price < stop_loss.stop_price
-        (זו בדיוק הסיבה לשגיאת 422 שראית — הסדר היה הפוך בצד ה-SELL)
+        שולח הזמנת BRACKET ל-Alpaca עם עיגול מחירים לפי 0.01 כדי למנוע sub-penny error.
         """
         symbol = symbol.upper()
 
@@ -172,16 +160,20 @@ class AlpacaBroker:
         if side == "buy":
             tp_price = entry_price * (1 + tp_pct)
             sl_price = entry_price * (1 - sl_pct)
-            # לפי דרישות Alpaca, ב-BUY אין צורך ב-limit_price ל-SL (אפשר רק stop_price)
-            stop_loss: Dict[str, Any] = {"stop_price": round(sl_price, 4)}
-            take_profit: Dict[str, Any] = {"limit_price": round(tp_price, 4)}
         else:
-            # SELL (short): רווח כאשר יורד -> TP מתחת למחיר כניסה
             tp_price = entry_price * (1 - tp_pct)
             sl_price = entry_price * (1 + sl_pct)
-            # חשוב! ב-SELL tp < sl, אחרת נקבל 422 ("take_profit.limit_price must be < stop_loss.stop_price")
-            stop_loss = {"stop_price": round(sl_price, 4)}
-            take_profit = {"limit_price": round(tp_price, 4)}
+
+        # ✅ עיגול לשתי ספרות אחרי הנקודה (0.01)
+        tp_price = round(tp_price, 2)
+        sl_price = round(sl_price, 2)
+
+        if side == "buy":
+            stop_loss = {"stop_price": sl_price}
+            take_profit = {"limit_price": tp_price}
+        else:
+            stop_loss = {"stop_price": sl_price}
+            take_profit = {"limit_price": tp_price}
 
         payload = {
             "symbol": symbol,
@@ -214,7 +206,6 @@ class AlpacaBroker:
     def _extract_err(e: requests.HTTPError) -> str:
         try:
             j = e.response.json()
-            # Alpaca מחזירה לרוב {"code": ..., "message": "..."}
             msg = j.get("message", j)
         except Exception:
             msg = e.response.text if e.response is not None else str(e)
