@@ -1,0 +1,38 @@
+# Python cache
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.pdb
+
+# Virtual environments
+.venv/
+env/
+venv/
+
+# Environment files
+.env
+
+# macOS files
+.DS_Store
+
+# Logs
+*.log
+
+# VSCode settings
+.vscode/
+
+# Docker
+*.pid
+*.seed
+*.bak
+*.swp
+*.swo
+
+# Build artifacts
+*.egg-info/
+dist/
+build/
+
+# SQLite database (אם נוצר)
+*.db
