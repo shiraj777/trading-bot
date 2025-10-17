@@ -12,10 +12,12 @@ from dotenv import load_dotenv
 class AlpacaClient:
     """
     לקוח פשוט לעבודה מול Alpaca (Paper/Live) באמצעות REST.
-    - טוען משתני סביבה (.env)
-    - בודק חיבור
-    - מחזיר מידע על חשבון/שוק
-    - שולח פקודות קנייה/מכירה
+
+    יכולות עיקריות:
+    - טעינת משתני סביבה (.env)
+    - בדיקת חשבון / שעון / פוזיציות
+    - שליחת הזמנות רגילות (market/limit)
+    - שליחת הזמנות Bracket עם חישוב נכון של take-profit / stop-loss ללונג/שורט
     """
 
     def __init__(
@@ -27,8 +29,9 @@ class AlpacaClient:
     ) -> None:
         load_dotenv()  # טען .env אם קיים לוקאלית
 
-        self.api_key = api_key or os.getenv("ALPACA_API_KEY")
-        self.api_secret = api_secret or os.getenv("ALPACA_API_SECRET")
+        # שימי לב: שמות המשתנים כאן הם ALPACA_API_KEY / ALPACA_API_SECRET / ALPACA_BASE_URL (כמו ב־Render)
+        self.api_key = api_key or os.getenv("ALPACA_API_KEY") or os.getenv("ALPACA_KEY_ID")
+        self.api_secret = api_secret or os.getenv("ALPACA_API_SECRET") or os.getenv("ALPACA_SECRET_KEY")
         # חשוב: בלי /v2 כאן. אנו נוסיף אותו בהמשך לנתיבים.
         self.base_url = (base_url or os.getenv("ALPACA_BASE_URL") or "").rstrip("/")
 
@@ -88,9 +91,7 @@ class AlpacaClient:
 
     # --------- פעולות עיקריות --------- #
     def check_connection(self) -> Dict[str, Any]:
-        """
-        בדיקת חשבון בסיסית. ב-Paper אמור לחזור אובייקט חשבון.
-        """
+        """בדיקת חשבון בסיסית."""
         data = self._get("account")
         self.log.info("Connected to Alpaca. Account ID: %s | Status: %s", data.get("id"), data.get("status"))
         return data
@@ -107,6 +108,7 @@ class AlpacaClient:
         """ביטול כל ההוראות הפתוחות."""
         return self._delete("orders")
 
+    # ---------- הזמנה רגילה ---------- #
     def submit_order(
         self,
         symbol: str,
@@ -130,10 +132,86 @@ class AlpacaClient:
         if order_type == "limit":
             if limit_price is None:
                 raise ValueError("limit_price נדרש בהוראת LIMIT")
-            payload["limit_price"] = limit_price
+            payload["limit_price"] = float(limit_price)
 
         payload.update(extra or {})
         self.log.info("Submitting order: %s", payload)
+        return self._post("orders", json=payload)
+
+    # ---------- הזמנת Bracket (TP/SL) ---------- #
+    def submit_bracket(
+        self,
+        symbol: str,
+        qty: int,
+        side: str,
+        *,
+        # אחד מהבאים נדרש: price או tp/sl באחוזים ביחס למחיר שוק שתקבל/י מבחוץ (מנוע האסטרטגיה)
+        entry_price: Optional[float] = None,
+        take_profit_price: Optional[float] = None,
+        stop_loss_price: Optional[float] = None,
+        # לחלופין, ניתן למסור אחוזים סביב מחיר הכניסה: למשל 0.01 = 1%
+        tp_pct: Optional[float] = None,
+        sl_pct: Optional[float] = None,
+        time_in_force: str = "day",
+        order_type: str = "market",
+    ) -> Dict[str, Any]:
+        """
+        שליחת הזמנת Bracket. חובה שיתקיים אחד:
+          - להגיש take_profit_price ו־stop_loss_price
+          - או להגיש entry_price + tp_pct/sl_pct לחישוב אוטומטי
+
+        לונג (side='buy'):
+            take_profit > stop_loss
+        שורט (side='sell'):
+            take_profit < stop_loss
+        """
+
+        if take_profit_price is None or stop_loss_price is None:
+            # צריך לחשב מ־entry_price + אחוזים
+            if entry_price is None or tp_pct is None or sl_pct is None:
+                raise ValueError("ל־Bracket נדרש או (TP/SL ישירים) או (entry_price + tp_pct + sl_pct)")
+            if side == "buy":
+                take_profit_price = float(entry_price) * (1.0 + float(tp_pct))
+                stop_loss_price = float(entry_price) * (1.0 - float(sl_pct))
+            else:  # sell / short
+                take_profit_price = float(entry_price) * (1.0 - float(tp_pct))
+                stop_loss_price = float(entry_price) * (1.0 + float(sl_pct))
+
+        # עיגול עד 2 ספרות (מניות) — אפשר לשפר ל־tick size אם נרצה
+        take_profit_price = round(float(take_profit_price), 2)
+        stop_loss_price = round(float(stop_loss_price), 2)
+
+        # ולידציה נגדית שמונעת HTTP 422
+        if side == "buy":
+            if not (take_profit_price > stop_loss_price):
+                raise ValueError(
+                    f"[Bracket] BUY דורש take_profit ({take_profit_price}) גדול מ־stop_loss ({stop_loss_price})"
+                )
+        else:  # sell (short)
+            if not (take_profit_price < stop_loss_price):
+                raise ValueError(
+                    f"[Bracket] SELL דורש take_profit ({take_profit_price}) קטן מ־stop_loss ({stop_loss_price})"
+                )
+
+        payload: Dict[str, Any] = {
+            "symbol": symbol.upper(),
+            "qty": qty,
+            "side": side,
+            "type": order_type,      # בדרך כלל 'market' לכניסה מיידית
+            "time_in_force": time_in_force,
+            "order_class": "bracket",
+            # Alpaca דורש:
+            "take_profit": {"limit_price": take_profit_price},
+            # ב־stop_loss נשלח רק stop_price (בלי limit_price) כדי להימנע ממצבי 422 מיותרים
+            "stop_loss": {"stop_price": stop_loss_price},
+        }
+
+        self.log.info(
+            "Submitting BRACKET: %s | TP=%s, SL=%s",
+            {k: v for k, v in payload.items() if k not in ("take_profit", "stop_loss")},
+            take_profit_price,
+            stop_loss_price,
+        )
         return self._post("orders", json=payload)
 
 
