@@ -1,7 +1,11 @@
 # run_worker.py
 from __future__ import annotations
-import os, time, logging
+
+import os
+import time
+import logging
 from datetime import datetime
+from typing import Any, Dict, List, Optional
 
 from services.data import fetch_bars
 from services.indicators import add_indicators
@@ -10,10 +14,21 @@ from services.risk import position_size
 from services import alerts
 from services.execution import PaperBroker, AlpacaBroker
 
-# ---------- env helpers ----------
-def _env(name: str, default: str) -> str:
+
+# --------------------- logging & version ---------------------
+def _env(name: str, default: Optional[str] = None) -> str:
     v = os.getenv(name)
-    return default if v is None or v == "" else v
+    if v is None or v == "":
+        return default if default is not None else ""
+    return v
+
+
+def _env_bool(name: str, default: bool = False) -> bool:
+    v = os.getenv(name)
+    if v is None or v == "":
+        return default
+    return str(v).strip().lower() in {"1", "true", "yes", "on"}
+
 
 def _env_float(name: str, default: float) -> float:
     v = os.getenv(name)
@@ -21,64 +36,117 @@ def _env_float(name: str, default: float) -> float:
         return default
     try:
         return float(v)
-    except ValueError:
+    except Exception:
         return default
 
-def _env_bool(name: str, default: bool) -> bool:
-    return _env(name, "true" if default else "false").lower() == "true"
 
-# ---------- logging ----------
+APP_VERSION = _env("APP_VERSION", "dev")
 LOG_LEVEL = _env("LOG_LEVEL", "INFO").upper()
 logging.basicConfig(
     level=getattr(logging, LOG_LEVEL, logging.INFO),
     format="%(asctime)s %(levelname)s:%(name)s:%(message)s",
 )
 log = logging.getLogger("worker")
+log.info("🚀 Starting worker version=%s", APP_VERSION)
 
-# ---------- env (רק מה־ENV, בלי קבועים בקוד) ----------
-PAPER            = _env_bool("PAPER", True)
-TICKER           = _env("TICKER", "TSLA")
-PERIOD           = _env("PERIOD", "60d")
-INTERVAL         = _env("INTERVAL", "15m")
-POLL_INTERVAL    = _env_float("POLL_INTERVAL", 60.0)          # שניות בין הרצות once()
-EQUITY           = _env_float("EQUITY", 10000.0)
-RISK_PCT         = _env_float("RISK_PCT", _env_float("MAX_RISK_PCT", 0.001))
-ALLOW_SHORT      = _env_bool("ALLOW_SHORT", True)
-BRACKET_MODE     = _env_bool("BRACKET_MODE", True)            # אם הברוקר תומך, ישתמש ב־bracket מה־ENV
-TAKE_PROFIT_PCT  = _env_float("TAKE_PROFIT_PCT", 0.01)        # לשימוש לוגי/לוגים בלבד; בפועל הברוקר יכול להשתמש במה שב־ENV
-STOP_LOSS_PCT    = _env_float("STOP_LOSS_PCT", 0.005)
-MIN_FLIP_SECS    = _env_float("MIN_FLIP_SECS", _env_float("MIN_FLIP_SECS", 60))  # דיבאונס לאותים
 
-SERVICE_NAME     = "trading-bot-worker"
+# --------------------- env ---------------------
+PAPER: bool         = _env_bool("PAPER", True)
+TICKER: str         = _env("TICKER", "AAPL")
+PERIOD: str         = _env("PERIOD", "1mo")
+INTERVAL: str       = _env("INTERVAL", "30m")
+POLL_INTERVAL: float = _env_float("POLL_INTERVAL", 30.0)
 
-# זיכרון קל של זמנים אחרונים לכל כיוון (דיבאונס)
-_last_signal_ts = {"buy": 0.0, "sell": 0.0}
+EQUITY: float       = _env_float("EQUITY", 10_000.0)
+RISK_PCT: float     = _env_float("RISK_PCT", 0.01)
 
+ALLOW_SHORT: bool   = _env_bool("ALLOW_SHORT", False)
+
+# BRACKET controls
+BRACKET_MODE: bool  = _env_bool("BRACKET_MODE", True)
+TAKE_PROFIT_PCT: float = _env_float("TAKE_PROFIT_PCT", 0.01)   # 1.0% by default
+STOP_LOSS_PCT: float   = _env_float("STOP_LOSS_PCT", 0.005)    # 0.5% by default
+
+# Min seconds to allow the same action or a flip (debounce)
+MIN_FLIP_SECS: float  = _env_float("MIN_FLIP_SECS", 60.0)
+
+# Heartbeat cadence (seconds); alerts.maybe_heartbeat משתמש בזה
+_env("HEARTBEAT_EVERY", "60")  # הערך נצרך בתוך מודול alerts עצמו
+
+
+# --------------------- broker selection ---------------------
 def _make_broker():
     """
-    בוחר ברוקר לפי ENV:
-    - אם קיימים ALPACA_KEY_ID + ALPACA_SECRET_KEY => AlpacaBroker
-    - אחרת PaperBroker (סימולטור)
+    לבחור ברוקר בהתאם ל־ENV.
+    אם ALPACA_KEY_ID/ALPACA_SECRET_KEY/ALPACA_BASE_URL קיימים – נשתמש ב־Alpaca.
+    אחרת – PaperBroker (סימולציה).
     """
-    key_id     = os.getenv("ALPACA_KEY_ID") or os.getenv("ALPACA_API_KEY")
-    secret_key = os.getenv("ALPACA_SECRET_KEY") or os.getenv("ALPACA_API_SECRET")
-    base       = os.getenv("ALPACA_BASE_URL", "https://paper-api.alpaca.markets")
+    key_id = os.getenv("ALPACA_KEY_ID") or os.getenv("ALPACA_API_KEY")
+    secret = os.getenv("ALPACA_SECRET_KEY") or os.getenv("ALPACA_API_SECRET")
+    base   = _env("ALPACA_BASE_URL", "https://paper-api.alpaca.markets")
 
-    if key_id and secret_key:
-        log.info("Using Alpaca broker (paper=%s, base=%s)", PAPER, base)
+    if key_id and secret:
+        paper = _env_bool("ALPACA_PAPER", True)
+        log.info("Using Alpaca broker (paper=%s, base=%s)", paper, base)
         return AlpacaBroker(
-            paper=PAPER,
+            paper=paper,
             key_id=key_id,
-            secret_key=secret_key,
+            secret_key=secret,
             base_url=base,
         )
-    else:
-        log.info("Using Paper broker (simulated)")
-        return PaperBroker(paper=True)
+    log.info("Using Paper broker (simulated)")
+    return PaperBroker(paper=True)
+
 
 BROKER = _make_broker()
 
-def describe_row(row) -> str:
+
+# --------------------- helpers / state ---------------------
+_last_action_side: Optional[str] = None   # 'buy' | 'sell'
+_last_action_ts: float = 0.0              # unix time
+
+def _throttle(side: str, min_secs: float) -> Optional[str]:
+    """
+    דיבאונס גם על “אותו צד” וגם על flip-flop.
+    מחזיר סיבת דילוג (string) אם צריך לדלג, אחרת None.
+    """
+    global _last_action_side, _last_action_ts
+    now = time.time()
+    if _last_action_side is None:
+        return None
+
+    elapsed = now - _last_action_ts
+    if elapsed < min_secs:
+        if _last_action_side == side:
+            return f"same-side throttle: {side} again after {elapsed:.1f}s (<{min_secs:.0f}s)"
+        else:
+            return f"flip debounce: {_last_action_side}→{side} after {elapsed:.1f}s (<{min_secs:.0f}s)"
+    return None
+
+
+def _update_action_clock(side: str) -> None:
+    global _last_action_side, _last_action_ts
+    _last_action_side = side
+    _last_action_ts = time.time()
+
+
+def _position_qty_safe(symbol: str) -> float:
+    try:
+        return float(BROKER.position_qty(symbol))
+    except Exception:
+        return 0.0
+
+
+def _open_orders_safe(symbol: str) -> List[Dict[str, Any]]:
+    try:
+        if hasattr(BROKER, "open_orders"):
+            return list(BROKER.open_orders(symbol))
+    except Exception:
+        pass
+    return []
+
+
+def _describe_row(row) -> str:
     parts = []
     def add(name, fmt="{:.4f}"):
         if name in row:
@@ -90,33 +158,8 @@ def describe_row(row) -> str:
     add("macd_signal", "{:.3f}"); add("macd_hist", "{:.3f}"); add("atr", "{:.3f}")
     return ", ".join(parts)
 
-def _has_open_order_for_symbol(symbol: str) -> bool:
-    """
-    מזעור כפילויות: אם לברוקר יש API להזמנות פתוחות – נשתמש בו.
-    אחרת נחזיר False ונמשיך כרגיל.
-    """
-    try:
-        if hasattr(BROKER, "has_open_orders"):
-            return bool(BROKER.has_open_orders(symbol))
-        if hasattr(BROKER, "open_orders"):
-            orders = BROKER.open_orders(symbol)  # צפוי להחזיר list
-            return bool(orders)
-    except Exception as e:
-        log.debug("open-orders check failed: %s", e)
-    return False
 
-def _debounce(side: str) -> bool:
-    """
-    לא לאפשר שני אותות ברצף לאותו כיוון תוך פחות מ-MIN_FLIP_SECS.
-    """
-    now = time.time()
-    last = _last_signal_ts.get(side, 0.0)
-    if now - last < MIN_FLIP_SECS:
-        log.info("debounce: skipping %s (only %.0fs since last %s)", side, now - last, side)
-        return False
-    _last_signal_ts[side] = now
-    return True
-
+# --------------------- main iteration ---------------------
 def once():
     raw = fetch_bars(TICKER, period=PERIOD, interval=INTERVAL)
     df  = add_indicators(raw)
@@ -124,104 +167,105 @@ def once():
         raise ValueError("Not enough data after indicators.")
     last = df.iloc[-1]
 
-    dec  = decide(df)  # dec.side in {"buy","sell","hold"}, dec.score, dec.reason
+    dec  = decide(df)  # returns object: .side in {"buy","sell","hold"}, .score, .reason
     price = float(last.get("close"))
     atr   = float(last.get("atr", 0.0))
+    qty, stop, take = position_size(equity=EQUITY, atr=atr, price=price, risk_pct=RISK_PCT)
 
-    # חישוב גודל פוזיציה לפי ה־ENV (בלי קבועים בקוד)
-    qty, stop, take = position_size(
-        equity=EQUITY,
-        atr=atr,
-        price=price,
-        risk_pct=RISK_PCT
-    )
-
-    # מצב פוזיציה קיים
-    try:
-        pos_qty = float(BROKER.position_qty(TICKER))
-    except Exception:
-        pos_qty = 0.0
-
-    # האם ברקט או מרקט, לצורך לוג בלבד (הברוקר עצמו כבר יודע מה לעשות לפי ENV)
-    order_class = "bracket" if BRACKET_MODE else "market"
+    pos_qty = _position_qty_safe(TICKER)
     stamp = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
     log.info("[%s] %s | %s | decision=%s score=%.3f reason=\"%s\" pos=%s | size=%s stop=%.4f take=%.4f | mode=%s tp=%.3f%% sl=%.3f%%",
-             stamp, TICKER, describe_row(last), dec.side, float(dec.score), dec.reason,
-             pos_qty, qty, stop, take, order_class, TAKE_PROFIT_PCT*100, STOP_LOSS_PCT*100)
+             stamp, TICKER, _describe_row(last), dec.side, float(dec.score), dec.reason,
+             pos_qty, qty, stop, take, "BRACKET" if BRACKET_MODE else "ATR",
+             TAKE_PROFIT_PCT*100.0, STOP_LOSS_PCT*100.0)
 
-    # heartbeat
-    alerts.maybe_heartbeat(SERVICE_NAME)
+    # heartbeat (אחת לכמה דקות לפי HEARTBEAT_EVERY בפנים)
+    alerts.maybe_heartbeat("trading-bot-worker")
 
-    # תנאים לוגיים לשליחת הוראה
-    if dec.side not in ("buy", "sell") or qty <= 0:
-        log.debug("skip: side=%s qty=%s", dec.side, qty)
-        return
+    # רק אם יש BUY/SELL — בודקים דיבאונס
+    if dec.side in ("buy", "sell"):
+        reason = _throttle(dec.side, MIN_FLIP_SECS)
+        if reason:
+            log.info("debounce: %s — skipping", reason)
+            return
 
-    # דיבאונס
-    if not _debounce(dec.side):
-        return
-
-    # לא לשלוח שוב אם יש כבר הזמנה פתוחה ל-symbol (אם נתמך)
-    if _has_open_order_for_symbol(TICKER):
-        log.info("skip: open order already exists for %s", TICKER)
-        return
-
-    # לא לשלוח שוב אם כבר יש פוזיציה באותו כיוון
-    # pos_qty > 0 => לונג. pos_qty < 0 => שורט.
+    # לוגיקת פתיחת/סגירת פוזיציה:
     can_send   = False
     order_side = None
     reason_ex  = ""
 
     if dec.side == "buy":
-        if pos_qty > 0:
-            log.info("skip: already long (pos=%.0f)", pos_qty)
-            return
-        # buy מכסה שורט (אם יש) או פותח לונג
-        can_send   = True
-        order_side = "buy"
-        if pos_qty < 0:
-            reason_ex = " (cover short)"
-
+        # קונים רק אם אין לונג קיים (או יש שורט – אז זה מכסה אותו)
+        if pos_qty <= 0:
+            can_send   = True
+            order_side = "buy"
+            if pos_qty < 0:
+                reason_ex = " (cover short)"
     elif dec.side == "sell":
-        if pos_qty < 0:
-            log.info("skip: already short (pos=%.0f)", pos_qty)
-            return
         if pos_qty > 0:
-            # sell יסגור/יקטין לונג
             can_send   = True
             order_side = "sell"
+        elif ALLOW_SHORT:
+            can_send   = True
+            order_side = "sell"
+            reason_ex  = " (open short)"
         else:
-            # אין לונג – זה פתיחת שורט
-            if ALLOW_SHORT:
-                can_send   = True
-                order_side = "sell"
-                reason_ex  = " (open short)"
-            else:
-                log.info("skip: short not allowed and no long to close")
-                return
+            can_send = False
 
-    if not can_send or not order_side:
-        log.debug("skip: decision=%s pos=%s allow_short=%s", dec.side, pos_qty, ALLOW_SHORT)
+    # אם אין מה לשלוח – סיימנו
+    if not (can_send and order_side and qty > 0):
+        log.debug("skip: decision=%s pos=%s allow_short=%s qty=%s", dec.side, pos_qty, ALLOW_SHORT, qty)
         return
 
-    # שליחת הוראה
+    # אם יש הזמנה פתוחה – לא שולחים כפול
+    oo = _open_orders_safe(TICKER)
+    if oo:
+        log.info("skip: open order already exists for %s (n=%d)", TICKER, len(oo))
+        return
+
+    # שליחה: BRACKET או ATR
+    res = None
     try:
-        res = BROKER.place_order(TICKER, order_side, qty, price, stop, take)
-        if res.ok:
+        if BRACKET_MODE and hasattr(BROKER, "place_bracket"):
+            # נשלח באחוזים (ה־PaperBroker/AlpacaBroker אצלך תומכים בקריאה הזו)
+            log.info("Sending BRACKET | %s %s x%s | tp=%.3f%% sl=%.3f%%",
+                     order_side.upper(), TICKER, qty, TAKE_PROFIT_PCT*100, STOP_LOSS_PCT*100)
+            res = BROKER.place_bracket(
+                symbol=TICKER,
+                side=order_side,
+                qty=int(qty),
+                tp_pct=TAKE_PROFIT_PCT,
+                sl_pct=STOP_LOSS_PCT,
+            )
+        else:
+            # ATR-based (fallback)
+            log.info("Sending MARKET | %s %s x%s | stop=%.4f take=%.4f (ATR mode)",
+                     order_side.upper(), TICKER, qty, stop, take)
+            res = BROKER.place_order(TICKER, order_side, int(qty), price, stop, take)
+
+        if res and getattr(res, "ok", False):
             alerts.notify_trade(order_side, TICKER, qty, price, stop, take,
                                 dec.reason + reason_ex, paper=BROKER.paper)
-            log.info("order ok id=%s status=%s filled=%s avg=%s", res.id, res.status, res.filled_qty, res.avg_price)
+            log.info("order ok id=%s status=%s filled=%s avg=%s",
+                     getattr(res, "id", "?"), getattr(res, "status", "?"),
+                     getattr(res, "filled_qty", "?"), getattr(res, "avg_price", "?"))
+            _update_action_clock(order_side)
         else:
-            alerts.notify_error(f"order failed for {order_side} {TICKER} x{qty}", Exception(res.error or "order error"))
-            log.error("order failed: %s", res.error)
-    except Exception as e:
-        alerts.notify_error("order exception", e)
-        log.exception("order exception")
+            err_msg = getattr(res, "error", "order error")
+            alerts.notify_error(f"order failed for {order_side} {TICKER} x{qty}", Exception(err_msg))
+            log.error("order failed: %s", err_msg)
 
+    except Exception as e:
+        log.exception("order exception")
+        alerts.notify_error("order exception", e)
+
+
+# --------------------- main loop ---------------------
 def main():
-    alerts.notify_start(SERVICE_NAME, paper=PAPER, ticker=TICKER, interval=INTERVAL)
-    log.info("Starting worker polling %s every %.0f s (PAPER=%s, PERIOD=%s, INTERVAL=%s, BRACKET_MODE=%s)",
-             TICKER, POLL_INTERVAL, PAPER, PERIOD, INTERVAL, BRACKET_MODE)
+    alerts.notify_start("trading-bot-worker", paper=PAPER, ticker=TICKER, interval=INTERVAL)
+    log.info("Starting worker polling %s every %.0f s (PAPER=%s, PERIOD=%s, INTERVAL=%s, BRACKET_MODE=%s tp=%.3f%% sl=%.3f%%)",
+             TICKER, POLL_INTERVAL, PAPER, PERIOD, INTERVAL, BRACKET_MODE,
+             TAKE_PROFIT_PCT*100.0, STOP_LOSS_PCT*100.0)
     while True:
         try:
             once()
@@ -231,6 +275,7 @@ def main():
             log.exception("iteration failed")
             alerts.notify_error("iteration failed", e)
         time.sleep(POLL_INTERVAL)
+
 
 if __name__ == "__main__":
     try:
