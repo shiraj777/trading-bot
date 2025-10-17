@@ -2,40 +2,16 @@
 from __future__ import annotations
 
 import logging
-import os
-import time
 from dataclasses import dataclass
 from typing import Optional, Dict, Any
 
-from .alpaca_client import AlpacaClient
+import requests
+
+from services.alpaca_client import AlpacaClient
 
 
-# ---------- כלי עזר לסביבה ----------
-def _env(name: str, default: str = "") -> str:
-    v = os.getenv(name)
-    return default if v is None or v == "" else v
-
-
-def _env_bool(name: str, default: bool) -> bool:
-    v = os.getenv(name)
-    if v is None or v == "":
-        return default
-    return v.strip().lower() in ("1", "true", "yes", "y", "on")
-
-
-def _env_float(name: str, default: float) -> float:
-    v = os.getenv(name)
-    if v is None or v == "":
-        return default
-    try:
-        return float(v)
-    except ValueError:
-        return default
-
-
-# ---------- תוצאות ברוקר ----------
 @dataclass
-class BrokerResult:
+class ExecResult:
     ok: bool
     id: Optional[str] = None
     status: Optional[str] = None
@@ -44,163 +20,202 @@ class BrokerResult:
     error: Optional[str] = None
 
 
-# ---------- ברוקר דמה (לסימולציה) ----------
+# ---------------------------------------------------------------------
+# Paper (simulated) broker
+# ---------------------------------------------------------------------
 class PaperBroker:
     """
-    ברוקר דמה. לא שולח לשום מקום, מיועד לסימולציה בלבד.
+    סימולטור פשוט לתהליכי שליחה/פוזיציה.
     """
-    paper: bool = True
-
     def __init__(self, paper: bool = True) -> None:
         self.paper = paper
-        self.log = logging.getLogger("PaperBroker")
-        if not self.log.handlers:
-            logging.basicConfig(level=logging.INFO,
-                                format="%(asctime)s %(levelname)s:%(name)s:%(message)s")
+        self.log = logging.getLogger(self.__class__.__name__)
+        self._pos: Dict[str, float] = {}  # symbol -> qty float
+
+    # --- ממשקים משותפים ---
+    def position_qty(self, symbol: str) -> float:
+        return float(self._pos.get(symbol.upper(), 0.0))
+
+    def _apply_pos(self, symbol: str, side: str, qty: int):
+        s = symbol.upper()
+        cur = self._pos.get(s, 0.0)
+        if side == "buy":
+            cur += qty
+        else:
+            cur -= qty
+        self._pos[s] = cur
 
     def place_order(
         self, symbol: str, side: str, qty: int, price: float,
         stop: float, take: float
-    ) -> BrokerResult:
-        self.log.info("[PAPER] %s %s x%s @%.2f (stop=%.2f, take=%.2f)",
-                      side, symbol, qty, price, stop, take)
-        # מחזירים כאילו הכול הצליח
-        return BrokerResult(ok=True, id="paper-sim", status="accepted",
-                            filled_qty="0", avg_price=str(price))
+    ) -> ExecResult:
+        self._apply_pos(symbol, side, qty)
+        self.log.info(
+            "[SIM] MARKET %s %s x%s @%.4f | stop=%.4f take=%.4f",
+            side, symbol, qty, price, stop, take
+        )
+        return ExecResult(ok=True, id="sim-order-1", status="accepted",
+                          filled_qty=str(qty), avg_price=f"{price:.4f}")
+
+    def place_bracket(
+        self, symbol: str, side: str, qty: int,
+        entry_price: float, tp_pct: float, sl_pct: float
+    ) -> ExecResult:
+        # חישוב מחירי יעד לצורך לוגים בלבד
+        if side == "buy":
+            tp = entry_price * (1 + tp_pct)
+            sl = entry_price * (1 - sl_pct)
+        else:
+            tp = entry_price * (1 - tp_pct)  # רווח בסל=ירידה
+            sl = entry_price * (1 + sl_pct)  # SL בסל=עליה
+        self._apply_pos(symbol, side, qty)
+        self.log.info(
+            "[SIM] BRACKET %s %s x%s @%.4f | tp=%.4f sl=%.4f (tp%%=%.3f sl%%=%.3f)",
+            side, symbol, qty, entry_price, tp, sl, tp_pct*100, sl_pct*100
+        )
+        return ExecResult(ok=True, id="sim-bracket-1", status="accepted",
+                          filled_qty=str(qty), avg_price=f"{entry_price:.4f}")
 
 
-# ---------- ברוקר Alpaca ----------
+# ---------------------------------------------------------------------
+# Alpaca broker (real REST)
+# ---------------------------------------------------------------------
 class AlpacaBroker:
     """
-    שליחת הוראות אמיתיות ל-Alpaca.
-    מיישם ברירת־מחדל רכה לביצוע ב-BRACKET (TP/SL) כדי למנוע שגיאות 422.
-    ניתן לכבות ברקט דרך BRACKET_MODE=false.
+    עטיפה ל-Alpaca REST (Paper/Live) עם תמיכה ב-MARKET וב-BRACKET.
     """
-
-    paper: bool = True
-
-    def __init__(self, paper: bool = True) -> None:
+    def __init__(
+        self,
+        paper: bool = True,
+        key_id: Optional[str] = None,
+        secret_key: Optional[str] = None,
+        base_url: Optional[str] = None,
+        session: Optional[requests.Session] = None,
+    ) -> None:
         self.paper = paper
-        self.log = logging.getLogger("AlpacaBroker")
-        if not self.log.handlers:
-            logging.basicConfig(level=logging.INFO,
-                                format="%(asctime)s %(levelname)s:%(name)s:%(message)s")
+        self.client = AlpacaClient(
+            api_key=key_id,
+            api_secret=secret_key,
+            base_url=base_url,
+            session=session,
+        )
+        self.log = logging.getLogger(self.__class__.__name__)
 
-        # קריאה ל־env – Render / .env
-        # בסיס ה־URL אמור להיות "https://paper-api.alpaca.markets" או "https://api.alpaca.markets"
-        base = _env("ALPACA_BASE_URL", "https://paper-api.alpaca.markets")
-
-        # הגדרות אסטרטגיה
-        self.bracket_mode = _env_bool("BRACKET_MODE", True)  # שליחת ברקט כברירת מחדל
-        self.tp_pct       = _env_float("TAKE_PROFIT_PCT", 0.010)  # 1% רווח
-        self.sl_pct       = _env_float("STOP_LOSS_PCT",   0.005)  # 0.5% הפסד
-        self.allow_short  = _env_bool("ALLOW_SHORT", True)
-        # מניעת "פליפים" מהירים מדי
-        self.min_flip_secs = _env_float("MIN_FLIP_SECS", 2.0)
-        self._last_side_ts: Dict[str, float] = {}
-
-        # יצירת לקוח ה-REST
-        self.client = AlpacaClient(base_url=base)
-
-        # בדיקת חיבור (לא חובה אך נחמד)
+    # --------- עזר/ממשקים ---------
+    def position_qty(self, symbol: str) -> float:
+        """
+        מנסה להביא פוזיציה ל-symbol. אם אין פוזיציה תחזור 0.
+        """
         try:
-            acct = self.client.check_connection()
-            self.log.info("Alpaca ready. equity=%s buying_power=%s shorting_enabled=%s",
-                          acct.get("equity"), acct.get("buying_power"), acct.get("shorting_enabled"))
-        except Exception as e:
-            self.log.warning("could not pre-check account: %s", e)
+            data = self.client._get(f"positions/{symbol.upper()}")
+            # אם יש, זה אובייקט יחיד
+            qty = float(data.get("qty", 0.0))
+            return qty
+        except requests.HTTPError as e:
+            # אם אין פוזיציה, Alpaca מחזירה 404
+            if e.response is not None and e.response.status_code == 404:
+                return 0.0
+            raise
 
-    # ---------- מניעת פליפים חדים ----------
-    def _throttle_side(self, symbol: str, side: str) -> None:
-        # side יכול להיות 'buy' או 'sell'
-        now = time.time()
-        key = f"{symbol}:{side}"
-        last = self._last_side_ts.get(key, 0.0)
-        if now - last < self.min_flip_secs:
-            time.sleep(max(0.0, self.min_flip_secs - (now - last)))
-        self._last_side_ts[key] = time.time()
-
-    # ---------- חישובי TP/SL ----------
-    def _derive_pcts_from_prices(
-        self, side: str, entry_price: float, stop: float, take: float
-    ) -> tuple[float, float]:
-        """
-        אם עברו לנו גם stop/take (מהאלגוריתם), נתרגם אותם לאחוזים.
-        אחרת, נשאר עם tp/sl ברירת המחדל מה-env.
-        """
-        tp_pct = self.tp_pct
-        sl_pct = self.sl_pct
-        if entry_price and stop > 0 and take > 0:
-            if side == "buy":
-                tp_pct = max(0.0001, (take - entry_price) / entry_price)
-                sl_pct = max(0.0001, (entry_price - stop) / entry_price)
-            else:  # sell/short
-                tp_pct = max(0.0001, (entry_price - take) / entry_price)
-                sl_pct = max(0.0001, (stop - entry_price) / entry_price)
-        return tp_pct, sl_pct
-
-    # ---------- שליחת הוראה ----------
+    # --------- MARKET (הקיים) ---------
     def place_order(
-        self, symbol: str, side: str, qty: int, price: float,
-        stop: float, take: float
-    ) -> BrokerResult:
+        self, symbol: str, side: str, qty: int,
+        price: float, stop: float, take: float
+    ) -> ExecResult:
         """
-        side: 'buy' או 'sell'
-        אם BRACKET_MODE=true -> שולח ברקט עם TP/SL המחושבים סביב 'price'.
-        אחרת -> הוראת Market רגילה.
+        פקודת MARKET רגילה (אפשר להרחיב ל-limit וכו'). כאן נשמרת התנהגות הפלאגין
+        ההיסטורי – הנתונים stop/take רק ללוג/התראה, Alpaca לא מקבלם ב-MARKET.
         """
+        payload = {
+            "symbol": symbol.upper(),
+            "qty": str(qty),
+            "side": side,
+            "type": "market",
+            "time_in_force": "day",
+        }
         try:
-            if side not in ("buy", "sell"):
-                return BrokerResult(ok=False, error=f"invalid side: {side}")
-
-            if side == "sell" and not self.allow_short:
-                return BrokerResult(ok=False, error="shorts disabled (ALLOW_SHORT=false)")
-
-            self._throttle_side(symbol, side)
-
-            # אם ברקט:
-            if self.bracket_mode:
-                tp_pct, sl_pct = self._derive_pcts_from_prices(side, price, stop, take)
-
-                # הגנה: אם חישוב ה־pct יוצא אפסי/שווה – תרחיקי אותם קצת
-                if abs(tp_pct - sl_pct) < 1e-6:
-                    tp_pct += 0.001
-
-                self.log.info(
-                    "Submitting BRACKET | %s %s x%s @%.4f | tp=%.3f%% sl=%.3f%%",
-                    side, symbol, qty, price, tp_pct * 100.0, sl_pct * 100.0
-                )
-
-                res = self.client.submit_bracket(
-                    symbol=symbol,
-                    qty=qty,
-                    side=side,
-                    entry_price=float(price),
-                    tp_pct=float(tp_pct),
-                    sl_pct=float(sl_pct),
-                    time_in_force="day",
-                )
-            else:
-                # הוראת Market בסיסית
-                self.log.info("Submitting MARKET | %s %s x%s", side, symbol, qty)
-                res = self.client.submit_order(
-                    symbol=symbol,
-                    qty=qty,
-                    side=side,
-                    order_type="market",
-                    time_in_force="day",
-                )
-
-            # החזרה מפורקת לתוצאת ברוקר
-            return BrokerResult(
-                ok=True,
-                id=res.get("id"),
-                status=res.get("status"),
-                filled_qty=res.get("filled_qty"),
-                avg_price=res.get("filled_avg_price"),
+            self.log.info(
+                "Alpaca MARKET submit: %s", payload
             )
+            data = self.client._post("orders", json=payload)
+            return ExecResult(
+                ok=True,
+                id=data.get("id"),
+                status=data.get("status"),
+                filled_qty=data.get("filled_qty"),
+                avg_price=data.get("filled_avg_price"),
+            )
+        except requests.HTTPError as e:
+            err = self._extract_err(e)
+            self.log.error("MARKET error: %s", err)
+            return ExecResult(ok=False, error=err)
 
-        except Exception as e:
-            # שגיאה ברורה ללוג / טלגרם
-            self.log.exception("alpaca order failed")
-            return BrokerResult(ok=False, error=str(e))
+    # --------- BRACKET ---------
+    def place_bracket(
+        self,
+        symbol: str,
+        side: str,
+        qty: int,
+        entry_price: float,
+        tp_pct: float,
+        sl_pct: float,
+    ) -> ExecResult:
+        """
+        שולח הזמנת BRACKET ל-Alpaca:
+        - BUY: take_profit.limit_price > stop_loss.stop_price
+        - SELL: take_profit.limit_price < stop_loss.stop_price
+        (זו בדיוק הסיבה לשגיאת 422 שראית — הסדר היה הפוך בצד ה-SELL)
+        """
+        symbol = symbol.upper()
+
+        # חישוב מחירי TP/SL לפי צד
+        if side == "buy":
+            tp_price = entry_price * (1 + tp_pct)
+            sl_price = entry_price * (1 - sl_pct)
+            # לפי דרישות Alpaca, ב-BUY אין צורך ב-limit_price ל-SL (אפשר רק stop_price)
+            stop_loss: Dict[str, Any] = {"stop_price": round(sl_price, 4)}
+            take_profit: Dict[str, Any] = {"limit_price": round(tp_price, 4)}
+        else:
+            # SELL (short): רווח כאשר יורד -> TP מתחת למחיר כניסה
+            tp_price = entry_price * (1 - tp_pct)
+            sl_price = entry_price * (1 + sl_pct)
+            # חשוב! ב-SELL tp < sl, אחרת נקבל 422 ("take_profit.limit_price must be < stop_loss.stop_price")
+            stop_loss = {"stop_price": round(sl_price, 4)}
+            take_profit = {"limit_price": round(tp_price, 4)}
+
+        payload = {
+            "symbol": symbol,
+            "qty": str(qty),
+            "side": side,
+            "type": "market",
+            "time_in_force": "day",
+            "order_class": "bracket",
+            "take_profit": take_profit,
+            "stop_loss": stop_loss,
+        }
+
+        try:
+            self.log.info("Alpaca BRACKET submit: %s", payload)
+            data = self.client._post("orders", json=payload)
+            return ExecResult(
+                ok=True,
+                id=data.get("id"),
+                status=data.get("status"),
+                filled_qty=data.get("filled_qty"),
+                avg_price=data.get("filled_avg_price"),
+            )
+        except requests.HTTPError as e:
+            err = self._extract_err(e)
+            self.log.error("BRACKET error: %s", err)
+            return ExecResult(ok=False, error=err)
+
+    # --------- helpers ---------
+    @staticmethod
+    def _extract_err(e: requests.HTTPError) -> str:
+        try:
+            j = e.response.json()
+            # Alpaca מחזירה לרוב {"code": ..., "message": "..."}
+            msg = j.get("message", j)
+        except Exception:
+            msg = e.response.text if e.response is not None else str(e)
+        return f"HTTP {getattr(e.response,'status_code', '???')}: {msg}"
